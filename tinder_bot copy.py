@@ -213,6 +213,7 @@ class EnhancedTinderBot:
             'like_users_who_liked_me': default.getboolean('LikeUsersWhoLikedMe', True),
             'process_accounts': default.getboolean('ProcessAccounts', True),
             'swipe_liked_me_gold_if_over': default.getint('SwipeLikedMeGoldIfOver', 50),
+            'expiring_soon_days': default.getint('ExpiringSoonDays', 7),
             'swipe_time': default.get('Swipetime', '0-23'),
             'percentage': default.getint('Percentage', 100),
             'max_likes_per_day': default.getint('MaxLikesPerDay', 80),
@@ -1287,26 +1288,32 @@ class EnhancedTinderBot:
     
 
     def _is_account_ready(self, account: Dict) -> bool:
-        """Enhanced account readiness check - accounts with likes always ready"""
+        """Enhanced account readiness check - REQUIRES USERNAME AND LIKES"""
         account_id = account['id']
+        
+        # NEW: First check if account has username - REQUIRED
+        username = account.get('assigned_username')
+        if not username or username == 'Unknown':
+            logging.debug(f"Account {account_id} has no username assigned")
+            return False
+        
+        # NEW: Check if account has likes to process - REQUIRED
+        liked_me_count = account.get('liked_me_count', 0)
+        if liked_me_count == 0:
+            logging.debug(f"Account {account_id} has no likes to process")
+            return False
         
         # Check daily like limits
         if self.check_daily_like_limit(account_id):
             logging.debug(f"Account {account_id} hit daily like limit")
             return False
         
-        # NEW: If account has likes, it's ALWAYS ready (no cooldown, no time checks)
-        liked_me_count = account.get('liked_me_count', 0)
-        if liked_me_count > 0:
-            logging.info(f"Account {account_id} has {liked_me_count} likes - bypassing all checks")
-            return True
-        
-        # For accounts with no likes, check timezone and swipe time
+        # Check timezone and swipe time
         if not self.is_in_swipe_time(account):
             logging.debug(f"Account {account_id} outside swipe time")
             return False
         
-        # Check session cooldown only for accounts with no likes
+        # Check session cooldown
         if self.needs_session_cooldown(account):
             logging.debug(f"Account {account_id} in session cooldown")
             return False
@@ -1319,11 +1326,9 @@ class EnhancedTinderBot:
                 logging.debug(f"Account {account_id} has high error rate: {error_rate:.2f}")
                 return False
         
-        # Check if it's time to check for new likes
-        if self.should_check_likes_for_account(account):
-            return True
-        
-        return False
+        # Account has username and likes - ready to process
+        logging.info(f"Account {account_id} ({username}) ready with {liked_me_count} likes")
+        return True
 
 
     def _print_detailed_account_status_with_timezone(self, all_accounts: List[Dict]):
@@ -1665,6 +1670,7 @@ class EnhancedTinderBot:
         api = self._initialize_api(account)
         if not api:
             print("   ❌ Account banned or authentication failed")
+            self._check_account_status_and_report(account_id, "Authentication failed", "API initialization failed")
             self.end_enhanced_session(account_id, session_id, {})
             return
         
@@ -1693,6 +1699,7 @@ class EnhancedTinderBot:
             profile_data = api.profile()
             if not profile_data:
                 print("   ❌ Failed to get profile - account may be dead")
+                self._check_account_status_and_report(account_id, "Profile fetch failed", "Account may be dead or banned")
                 self.end_enhanced_session(account_id, session_id, session_stats)
                 return
             
@@ -1701,6 +1708,7 @@ class EnhancedTinderBot:
             if not is_gold:
                 print(f"   ❌ Account is NOT GOLD - marking as non-working")
                 print(f"   📊 Stats for {city}: Free account (no Gold/Plus subscription)")
+                self._check_account_status_and_report(account_id, "Account is not Gold", "Free account without Gold/Plus subscription")
                 # Mark as banned since we only want Gold accounts
                 self._mark_account_banned(account_id)
                 self.end_enhanced_session(account_id, session_id, session_stats)
@@ -1714,6 +1722,19 @@ class EnhancedTinderBot:
                 print(f"   💕 Updated liked me count: {liked_me_count}")
             else:
                 liked_me_count = account.get('liked_me_count', 0)
+            
+            # Check if Gold is expiring soon
+            if gold_expires_at:
+                expiring_soon = self._check_gold_expiring_soon(gold_expires_at)
+                if expiring_soon:
+                    print(f"   ⚠️  Gold expiring soon: {gold_expires_at[:10]}")
+                    self._check_account_status_and_report(account_id, "Gold expiring soon", f"Gold expires on {gold_expires_at[:10]}")
+                    
+                    # Check if we should still process based on SwipeLikedMeGoldIfOver
+                    if liked_me_count < self.config['swipe_liked_me_gold_if_over']:
+                        print(f"   ⏭️  Skipping - Gold expiring and only {liked_me_count} likes (threshold: {self.config['swipe_liked_me_gold_if_over']})")
+                        self.end_enhanced_session(account_id, session_id, session_stats)
+                        return
             
             print(f"   💛 Gold Status: Active (expires: {gold_expires_at[:10] if gold_expires_at else 'Unknown'})")
             
@@ -1787,6 +1808,9 @@ class EnhancedTinderBot:
             logging.error(f"Processing error for account {account_id}: {e}")
             logging.error(traceback.format_exc())
             
+            # Report the error
+            self._check_account_status_and_report(account_id, "Processing error", f"Exception during processing: {str(e)}")
+            
         finally:
             # Always end the session
             self.end_enhanced_session(account_id, session_id, session_stats)
@@ -1847,6 +1871,7 @@ class EnhancedTinderBot:
             # Handle 403 - Account banned
             if status_code == 403:
                 logging.warning(f"Account {account_id} received 403 - marking as banned")
+                self._check_account_status_and_report(account_id, "Account banned", "Received 403 Forbidden response")
                 self._mark_account_banned(account_id)
                 return False
             
@@ -1936,11 +1961,16 @@ class EnhancedTinderBot:
                             latitude = None
                             longitude = None
                         
-                        # Handle proxy - could be split across multiple parts due to colons
+                        # Handle proxy - expect host:port:user:pass format
                         if len(parts) > 5:
                             proxy_parts = parts[5:]
-                            proxy_combined = ':'.join(proxy_parts).strip()
-                            proxy = proxy_combined if proxy_combined else None
+                            if len(proxy_parts) >= 4:
+                                # Format: host:port:user:pass
+                                proxy = ':'.join(proxy_parts).strip()
+                            else:
+                                # Join remaining parts for compatibility
+                                proxy = ':'.join(proxy_parts).strip()
+                            proxy = proxy if proxy else None
                         else:
                             proxy = None
                         
@@ -2520,8 +2550,8 @@ class EnhancedTinderBot:
             # The longitude/latitude from token is just for the API, not for display
             # assigned_city should ALWAYS be the passport location name
             
-            # Enhanced username assignment
-            assigned_username = self.assign_username_enhanced(assigned_city)
+            # NEW: Don't assign username here - delay until profile update
+            assigned_username = None  # Will be assigned when profile needs updating
             
             # Create enhanced account record
             account_id = self.create_account_record_enhanced(
@@ -2699,6 +2729,16 @@ class EnhancedTinderBot:
             
             updates_made = False
             assigned_username = account.get('assigned_username')
+            
+            # NEW: Assign username only when needed for profile update
+            if not assigned_username or assigned_username == 'Unknown':
+                city = account.get('assigned_city', 'Unknown')
+                assigned_username = self.assign_username_when_needed(account_id, city)
+                if assigned_username:
+                    print(f"     👤 Assigned username: {assigned_username}")
+                else:
+                    print(f"     ❌ No usernames available for assignment")
+                    return False
             
             # Bio update - only if we have a username
             if self.config['update_bio'] and self.config['bio'] and assigned_username and assigned_username != 'Unknown':
@@ -3101,14 +3141,15 @@ class EnhancedTinderBot:
      
 
     def run_enhanced(self):
-        """Enhanced main bot loop with no username blocking"""
+        """Enhanced main bot loop with username requirement"""
         
-        # Initial username load - but don't block if empty
+        # Initial username load - REQUIRED
         self.usernames = self.load_usernames()
         if not self.usernames:
-            print("⚠️  WARNING: No usernames found in usernames.txt")
-            print("   Accounts will process but bio/prompts won't be updated")
-            self.usernames = []  # Empty list instead of returning
+            print("❌ ERROR: No usernames found in usernames.txt")
+            print("   Please add usernames to usernames.txt (one per line)")
+            print("   Accounts REQUIRE usernames to process!")
+            raise Exception("No usernames available - cannot process accounts without usernames")
         
         # Show initial summary
         self.print_enhanced_summary()
@@ -3121,13 +3162,14 @@ class EnhancedTinderBot:
                 cycle_count += 1
                 print(f"\n{'='*25} CYCLE {cycle_count} {'='*25}")
                 
-                # Reload usernames every cycle - but don't block
+                # Reload usernames every cycle - REQUIRED
                 previous_username_count = len(self.usernames)
                 self.usernames = self.load_usernames()
                 
                 if not self.usernames:
-                    print("⚠️  No usernames in usernames.txt - continuing without bio/prompt updates")
-                    self.usernames = []  # Empty list to prevent errors
+                    print("❌ ERROR: No usernames in usernames.txt - throwing exception for this cycle")
+                    print("   Please add usernames to usernames.txt to continue processing")
+                    raise Exception("No usernames available - cannot process accounts without usernames")
                 elif len(self.usernames) != previous_username_count:
                     print(f"📝 Username list updated: {previous_username_count} → {len(self.usernames)} usernames")
                 
@@ -3231,10 +3273,16 @@ class EnhancedTinderBot:
                 wait_minutes = wait_time // 60
                 wait_seconds = wait_time % 60
                 
+                # Add timestamp to waiting message
+                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                next_cycle_time = (datetime.now() + timedelta(seconds=wait_time)).strftime('%Y-%m-%d %H:%M:%S')
+                
                 if wait_seconds > 0:
                     print(f"\n⏱️  Waiting {wait_minutes} minutes {wait_seconds} seconds before next cycle...")
                 else:
                     print(f"\n⏱️  Waiting {wait_minutes} minutes before next cycle...")
+                print(f"    Current time: {current_time}")
+                print(f"    Next cycle at: {next_cycle_time}")
                 print("    Press Ctrl+C to stop")
                 print("="*70)
                 
@@ -3630,11 +3678,16 @@ class EnhancedTinderBot:
                             latitude = None
                             longitude = None
                         
-                        # Handle proxy - could be split across multiple parts due to colons
+                        # Handle proxy - expect host:port:user:pass format
                         if len(parts) > 5:
                             proxy_parts = parts[5:]
-                            proxy_combined = ':'.join(proxy_parts).strip()
-                            proxy = proxy_combined if proxy_combined else None
+                            if len(proxy_parts) >= 4:
+                                # Format: host:port:user:pass
+                                proxy = ':'.join(proxy_parts).strip()
+                            else:
+                                # Join remaining parts for compatibility
+                                proxy = ':'.join(proxy_parts).strip()
+                            proxy = proxy if proxy else None
                         else:
                             proxy = None
                         
@@ -3817,6 +3870,91 @@ class EnhancedTinderBot:
             logging.error(f"Error creating enhanced account record: {e}")
             return None
     
+    def assign_username_when_needed(self, account_id: int, city: str) -> Optional[str]:
+        """Assign username only when needed and move to done file instantly"""
+        if not self.usernames:
+            return None  # Return None instead of trying to pick from empty list
+        
+        if not city:
+            return random.choice(self.usernames) if self.usernames else None
+        
+        try:
+            with sqlite3.connect("tinder_bot.db", detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                
+                # Create username_usage table if it doesn't exist
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS username_usage (
+                        username TEXT,
+                        city TEXT,
+                        used_count INTEGER DEFAULT 0,
+                        last_used TIMESTAMP,
+                        PRIMARY KEY (username, city)
+                    )
+                """)
+                
+                # Shuffle for variety
+                shuffled_usernames = self.usernames.copy()
+                random.shuffle(shuffled_usernames)
+                
+                for username in shuffled_usernames:
+                    cursor.execute("""
+                        SELECT used_count FROM username_usage 
+                        WHERE username = ? AND city = ?
+                    """, (username, city))
+                    
+                    result = cursor.fetchone()
+                    used_count = result[0] if result else 0
+                    
+                    if used_count < self.config['tinders_per_username']:
+                        # Update usage with enhanced tracking
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO username_usage 
+                            (username, city, used_count, last_used)
+                            VALUES (?, ?, ?, ?)
+                        """, (username, city, used_count + 1, datetime.now()))
+                        
+                        # Update account with username
+                        cursor.execute("""
+                            UPDATE accounts SET assigned_username = ? WHERE id = ?
+                        """, (username, account_id))
+                        
+                        conn.commit()
+                        
+                        # INSTANTLY move username to done file
+                        self._move_username_to_done(username, city)
+                        
+                        logging.info(f"Username assignment: {username} for {city} - moved to done file")
+                        return username
+                
+                # If all usernames are exhausted, return random one
+                selected = random.choice(self.usernames)
+                logging.warning(f"All usernames exhausted for {city}, using {selected}")
+                return selected
+                
+        except Exception as e:
+            logging.error(f"Error in username assignment: {e}")
+            return random.choice(self.usernames) if self.usernames else None
+    
+    def _move_username_to_done(self, username: str, city: str):
+        """Move username to usernames_done.txt instantly"""
+        try:
+            # Write to usernames_done.txt
+            with open('usernames_done.txt', 'a', encoding='utf-8') as f:
+                f.write(f"{username},{city}\n")
+            
+            # Remove from usernames.txt
+            self._remove_username_from_file(username)
+            
+            # Remove from loaded usernames
+            if username in self.usernames:
+                self.usernames.remove(username)
+            
+            logging.info(f"Username '{username}' moved to usernames_done.txt for {city}")
+            
+        except Exception as e:
+            logging.error(f"Error moving username to done file: {e}")
+    
     def assign_username_enhanced(self, city: str) -> Optional[str]:
         """Enhanced username assignment - return None if no usernames available"""
         if not self.usernames:
@@ -3958,6 +4096,65 @@ class EnhancedTinderBot:
         except Exception as e:
             logging.error(f"Error checking enhanced Gold status: {e}")
             return False, None
+    
+    def _check_gold_expiring_soon(self, gold_expires_at: str) -> bool:
+        """Check if Gold subscription is expiring soon"""
+        try:
+            if isinstance(gold_expires_at, str):
+                expire_datetime = datetime.fromisoformat(gold_expires_at)
+            else:
+                expire_datetime = gold_expires_at
+            
+            days_until_expiry = (expire_datetime - datetime.now()).days
+            expiring_soon_days = self.config.get('expiring_soon_days', 7)
+            
+            return days_until_expiry <= expiring_soon_days
+        except Exception as e:
+            logging.error(f"Error checking Gold expiration: {e}")
+            return False
+    
+    def _check_account_status_and_report(self, account_id: int, issue_type: str, details: str):
+        """Check account status and report what happened"""
+        try:
+            with sqlite3.connect("tinder_bot.db", detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                
+                # Get account info
+                cursor.execute("""
+                    SELECT assigned_city, assigned_username, auth_token, status, ban_score
+                    FROM accounts WHERE id = ?
+                """, (account_id,))
+                
+                result = cursor.fetchone()
+                if result:
+                    city, username, auth_token, status, ban_score = result
+                    
+                    # Determine account status
+                    if status == 'banned':
+                        status_msg = "🚫 BANNED"
+                    elif status == 'dead':
+                        status_msg = "💀 DEAD"
+                    elif ban_score and ban_score >= 0.8:
+                        status_msg = "⚠️  HIGH BAN RISK"
+                    elif issue_type == "Gold expiring soon":
+                        status_msg = "⏰ GOLD EXPIRING"
+                    elif issue_type == "Account is not Gold":
+                        status_msg = "🆓 FREE ACCOUNT"
+                    else:
+                        status_msg = "❌ ISSUE DETECTED"
+                    
+                    print(f"   📊 Account Status Report:")
+                    print(f"      City: {city or 'Unknown'}")
+                    print(f"      Username: {username or 'Unknown'}")
+                    print(f"      Status: {status_msg}")
+                    print(f"      Issue: {issue_type}")
+                    print(f"      Details: {details}")
+                    
+                    # Log the issue
+                    logging.warning(f"Account {account_id} ({city}): {issue_type} - {details}")
+                    
+        except Exception as e:
+            logging.error(f"Error checking account status: {e}")
 
 
 
