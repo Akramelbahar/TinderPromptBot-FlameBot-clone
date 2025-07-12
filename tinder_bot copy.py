@@ -638,25 +638,47 @@ class EnhancedTinderBot:
    
    
     def should_process_accounts_now(self) -> bool:
-        """Check if we should process accounts based on swipe time"""
+        """Determine if ANY account is within its local swipe window.
+
+        Instead of relying on the host machine time, we iterate through all
+        active accounts, convert the current time to each account's timezone,
+        and check if that local hour is within the configured Swipetime range.
+        If at least one account qualifies, we return True so the cycle runs.
+        """
         if not self.config['process_accounts']:
             return False
-        
-        # Get current hour
-        current_hour = datetime.now().hour
-        start_hour, end_hour = map(int, self.config['swipe_time'].split('-'))
-        
-        # Check if in swipe time
-        if start_hour <= end_hour:
-            in_swipe_time = start_hour <= current_hour <= end_hour
-        else:
-            in_swipe_time = current_hour >= start_hour or current_hour <= end_hour
-        
-        if not in_swipe_time:
-            print(f"⏰ Outside swipe time ({self.config['swipe_time']}). Current hour: {current_hour}")
-            return False
-        
-        return True
+
+        try:
+            with sqlite3.connect("tinder_bot.db", detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, timezone_name FROM accounts WHERE status = 'active'")
+                rows = cursor.fetchall()
+
+                if not rows:
+                    return False
+
+                start_hour, end_hour = map(int, self.config['swipe_time'].split('-'))
+
+                for acc_id, tz_name in rows:
+                    tz_name = tz_name or 'UTC'
+                    try:
+                        tz = pytz.timezone(tz_name)
+                    except Exception:
+                        tz = pytz.UTC
+                    local_hour = datetime.now(tz).hour
+
+                    if start_hour <= end_hour:
+                        in_window = start_hour <= local_hour <= end_hour
+                    else:
+                        in_window = local_hour >= start_hour or local_hour <= end_hour
+
+                    if in_window:
+                        return True  # At least one account is ready by time
+        except Exception as e:
+            logging.error(f"Error in timezone-aware swipe check: {e}")
+
+        # If none are within swipe window
+        return False
    
    
    
@@ -1701,10 +1723,8 @@ class EnhancedTinderBot:
             is_gold, gold_expires_at = self.check_gold_status(profile_data)
             
             if not is_gold:
-                print(f"   ❌ Account is NOT GOLD - marking as non-working")
-                print(f"   📊 Stats for {city}: Free account (no Gold/Plus subscription)")
-                # Mark as banned since we only want Gold accounts
-                self._mark_account_banned(account_id)
+                print(f"   ⚠️  Account lost Gold/Plus subscription – skipping.")
+                self._mark_account_no_gold(account_id)
                 self.end_enhanced_session(account_id, session_id, session_stats)
                 return
             
@@ -2812,6 +2832,28 @@ class EnhancedTinderBot:
                 else:
                     print("     ✅ Prompt already set correctly")
             
+            # --------------------------------------------------------
+            # If we successfully updated the profile (bio or prompt) we
+            # now move the username to usernames_done.txt – but only if
+            # it hasn't been moved already during prompt update above.
+            # --------------------------------------------------------
+            if updates_made and assigned_username and self._is_valid_username(assigned_username):
+                try:
+                    # Append to done file if not already present
+                    already_done = False
+                    if os.path.exists('usernames_done.txt'):
+                        with open('usernames_done.txt', 'r', encoding='utf-8') as _f:
+                            already_done = any(ln.strip() == assigned_username for ln in _f.readlines())
+                    if not already_done:
+                        with open('usernames_done.txt', 'a', encoding='utf-8') as _f:
+                            _f.write(f"{assigned_username}\n")
+                    # Remove from usernames.txt
+                    self._remove_username_from_file(assigned_username)
+                    if assigned_username in self.usernames:
+                        self.usernames.remove(assigned_username)
+                except Exception as _e:
+                    logging.error(f"Error completing username move: {_e}")
+
             return updates_made
             
         except Exception as e:
@@ -4161,6 +4203,17 @@ class EnhancedTinderBot:
                 print(f"   ⏰ Waiting for swipe time {time_range} (currently {local_time_str} local time)")
             
             return 0
+
+    def _mark_account_no_gold(self, account_id: int):
+        """Downgrade account status when Gold/Plus is no longer active"""
+        try:
+            with sqlite3.connect("tinder_bot.db", detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE account_status SET is_gold = 0 WHERE account_id = ?", (account_id,))
+                conn.commit()
+            print(f"🚫 Account {account_id} downgraded to FREE status.")
+        except Exception as e:
+            logging.error(f"Error downgrading account {account_id}: {e}")
 
 def main():
     """Enhanced main function with better argument handling"""
