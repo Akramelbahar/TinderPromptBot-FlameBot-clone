@@ -252,6 +252,8 @@ class EnhancedTinderBot:
             'database_backup_interval': default.getint('DatabaseBackupInterval', 3600),
             'error_retry_delay': default.getint('ErrorRetryDelay', 180),
             'detailed_logging': default.getboolean('DetailedLogging', False),
+            # Gold expiry settings
+            'expiring_soon_days': default.getint('ExpiringSoonDays', 7),
         }
         
         print(f"✅ Clean configuration loaded successfully")
@@ -1717,6 +1719,26 @@ class EnhancedTinderBot:
             
             print(f"   💛 Gold Status: Active (expires: {gold_expires_at[:10] if gold_expires_at else 'Unknown'})")
             
+            # ------------------------------------------------------------
+            # Decide whether we should process likes for this account
+            # based on liked_me_count threshold or imminent Gold expiry.
+            # ------------------------------------------------------------
+            swipe_threshold = self.config.get('swipe_liked_me_gold_if_over', 50)
+            expiring_soon_days = self.config.get('expiring_soon_days', 7)
+
+            days_until_expire = 9999
+            if gold_expires_at:
+                try:
+                    expire_dt = datetime.fromisoformat(gold_expires_at)
+                    days_until_expire = (expire_dt - datetime.now()).days
+                except Exception:
+                    pass
+
+            if liked_me_count < swipe_threshold and days_until_expire > expiring_soon_days:
+                print(f"   ⏭️  Skipping account - only {liked_me_count} likes (< {swipe_threshold}) and Gold expires in {days_until_expire} days (> {expiring_soon_days}).")
+                self.end_enhanced_session(account_id, session_id, session_stats)
+                return
+            
             # If no likes, check if we should check for new ones
             if liked_me_count == 0:
                 if self.should_check_likes_for_account(account):
@@ -2520,8 +2542,8 @@ class EnhancedTinderBot:
             # The longitude/latitude from token is just for the API, not for display
             # assigned_city should ALWAYS be the passport location name
             
-            # Enhanced username assignment
-            assigned_username = self.assign_username_enhanced(assigned_city)
+            # Do not assign username at import stage; will be assigned when updating profile later
+            assigned_username = None
             
             # Create enhanced account record
             account_id = self.create_account_record_enhanced(
@@ -2700,9 +2722,29 @@ class EnhancedTinderBot:
             updates_made = False
             assigned_username = account.get('assigned_username')
             
+            # ------------------------------------------------------------
+            # On-demand username assignment: if this account does not yet
+            # have a username, grab the next available one only when we
+            # actually need to update bio/prompt. Do NOT remove the name
+            # from usernames.txt until the profile prompt update succeeds.
+            # ------------------------------------------------------------
+            if (not assigned_username) or (assigned_username == 'Unknown'):
+                new_username = self.assign_username_enhanced(account.get('assigned_city', 'Unknown'))
+                if new_username:
+                    assigned_username = new_username
+                    account['assigned_username'] = new_username
+                    # Persist to DB so subsequent calls see it
+                    try:
+                        with sqlite3.connect("tinder_bot.db", detect_types=sqlite3.PARSE_DECLTYPES) as _conn:
+                            _c = _conn.cursor()
+                            _c.execute("UPDATE accounts SET assigned_username = ? WHERE id = ?", (new_username, account_id))
+                            _conn.commit()
+                    except Exception as _e:
+                        logging.error(f"Error saving assigned username: {_e}")
+             
             # Bio update - only if we have a username
             if self.config['update_bio'] and self.config['bio'] and assigned_username and assigned_username != 'Unknown':
-                target_bio = self.config['bio']
+                target_bio = self.config['bio'].replace('%username%', assigned_username)
                 if '%username%' in target_bio:
                     target_bio = target_bio.replace('%username%', assigned_username)
                 
@@ -3126,8 +3168,18 @@ class EnhancedTinderBot:
                 self.usernames = self.load_usernames()
                 
                 if not self.usernames:
-                    print("⚠️  No usernames in usernames.txt - continuing without bio/prompt updates")
-                    self.usernames = []  # Empty list to prevent errors
+                    # No usernames available – skip this cycle entirely
+                    current_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    wait_time = self.config.get('wait_between_cycles', 900)
+                    wait_min = wait_time // 60
+                    print(f"{current_ts} ⚠️  No usernames available. Waiting {wait_min} minutes before next cycle…")
+                    try:
+                        time.sleep(wait_time)
+                    except KeyboardInterrupt:
+                        print("\n🛑 Interrupted during wait")
+                        break
+                    continue
+                
                 elif len(self.usernames) != previous_username_count:
                     print(f"📝 Username list updated: {previous_username_count} → {len(self.usernames)} usernames")
                 
@@ -3231,10 +3283,11 @@ class EnhancedTinderBot:
                 wait_minutes = wait_time // 60
                 wait_seconds = wait_time % 60
                 
+                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 if wait_seconds > 0:
-                    print(f"\n⏱️  Waiting {wait_minutes} minutes {wait_seconds} seconds before next cycle...")
+                    print(f"\n{timestamp_str} ⏱️  Waiting {wait_minutes} minutes {wait_seconds} seconds before next cycle…")
                 else:
-                    print(f"\n⏱️  Waiting {wait_minutes} minutes before next cycle...")
+                    print(f"\n{timestamp_str} ⏱️  Waiting {wait_minutes} minutes before next cycle…")
                 print("    Press Ctrl+C to stop")
                 print("="*70)
                 

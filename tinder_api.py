@@ -216,8 +216,34 @@ class TinderApi:
         self.profile_cache = None
         self.profile_cache_time = 0
         self.profile_cache_ttl = 300  # 5 minutes
-        self.proxies = {"socks5": proxy} if proxy else {}
-        
+
+        # ------------------------------------------------------------
+        # Proxy handling: support plain "host:port:user:pass" strings by
+        # converting them into the full socks5 URL expected by requests.
+        # ------------------------------------------------------------
+        self.proxies = {}
+        if proxy:
+            try:
+                # If the string already contains a scheme, keep as is
+                if proxy.startswith("socks5://") or proxy.startswith("http://") or proxy.startswith("https://"):
+                    proxy_url = proxy
+                else:
+                    # Handle host:port:user:pass (or host:port) formats
+                    parts = proxy.split(':')
+                    if len(parts) == 4:
+                        host, port, user, pwd = parts
+                        proxy_url = f"socks5://{user}:{pwd}@{host}:{port}"
+                    elif len(parts) == 2:
+                        host, port = parts
+                        proxy_url = f"socks5://{host}:{port}"
+                    else:
+                        # Fallback – assume full URL missing scheme
+                        proxy_url = f"socks5://{proxy}"
+                # Apply to all schemes for safety
+                self.proxies = {"http": proxy_url, "https": proxy_url, "socks5": proxy_url}
+            except Exception as _e:
+                logging.error(f"Invalid proxy format '{proxy}': {_e}")
+ 
         # Request tracking for anti-ban
         self.last_request_time = 0
         self.min_request_interval = 0.1
